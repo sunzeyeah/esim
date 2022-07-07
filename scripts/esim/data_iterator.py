@@ -45,7 +45,7 @@ class TextIterator:
     def __init__(self, input_file, tokenizer,
                  batch_size=128, vocab_size=-1, shuffle=True, factor=20,
                  bos_token="[CLS]", eos_token="[SEP]"):
-        self.input_file = open(input_file, 'r')
+        self.input_file = open(input_file, "r", encoding="utf-8")
         self.tokenizer = tokenizer
         self.batch_size = batch_size
         self.vocab_size = vocab_size
@@ -73,9 +73,13 @@ class TextIterator:
                 line = self.input_file.readline()
                 if line == "":
                     break
-                arr = line.strip().split('\t')
-                assert len(arr) == 3
-                self.instance_buffer.append(arr)
+                # arr = line.strip("\n").split('\t')
+                # assert len(arr) == 3
+                # self.instance_buffer.append(arr)
+                label, src_id, src_title, src_pvs, tgt_id, tgt_title, tgt_pvs = line.strip("\n").split('\t')
+                src_text = src_title + " [SEP] " + " ".join(jieba.cut(src_pvs))
+                tgt_text = tgt_title + " [SEP] " + " ".join(jieba.cut(tgt_pvs))
+                self.instance_buffer.append((src_text, tgt_text, label))
 
             if self.shuffle:
                 # sort by length of sum of target buffer and target_buffer
@@ -88,8 +92,8 @@ class TextIterator:
                 length_idx = length_array.argsort()
                 # shuffle mini-batch
                 tindex = []
-                small_index = range(
-                    int(math.ceil(len(length_idx) * 1. / self.batch_size)))
+                small_index = list(range(
+                    int(math.ceil(len(length_idx) * 1. / self.batch_size))))
                 random.shuffle(small_index)
                 for i in small_index:
                     if (i + 1) * self.batch_size > len(length_idx):
@@ -115,8 +119,10 @@ class TextIterator:
                 except IndexError:
                     break
 
-                sent1 = " ".join(jieba.cut(current_instance[0]))
-                sent2 = " ".join(jieba.cut(current_instance[1]))
+                # sent1 = " ".join(jieba.cut(current_instance[0]))
+                # sent2 = " ".join(jieba.cut(current_instance[1]))
+                sent1 = current_instance[0]
+                sent2 = current_instance[1]
                 label = int(current_instance[2])
 
                 sent1_tokens = [self.bos_token] + self.tokenizer.tokenize(sent1) + [self.eos_token]

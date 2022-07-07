@@ -108,13 +108,13 @@ def prepare_data(instance):
     # for l_q, s_q, l_x, s_x, l_y, s_y in zip(lengths_q, queries, lengths_x, seqs_x, lengths_y, seqs_y):
     for l_x, s_x, l_y, s_y, l in zip(lengths_x, seqs_x, lengths_y, seqs_y, labels):
         if l_x > maxlen_1:
-            new_seqs_x.append(s_x[-maxlen_1:])
+            new_seqs_x.append([s_x[0]] + s_x[1:(maxlen_1-1)] + [s_x[-1]])
             new_lengths_x.append(maxlen_1)
         else:
             new_seqs_x.append(s_x)
             new_lengths_x.append(l_x)
         if l_y > maxlen_2:
-            new_seqs_y.append(s_y[:maxlen_2])
+            new_seqs_y.append([s_y[0]] + s_y[1:(maxlen_2-1)] + [s_y[-1]])
             new_lengths_y.append(maxlen_2)
         else:
             new_seqs_y.append(s_y)
@@ -234,7 +234,7 @@ def load_word_embedding():
 
     if FLAGS.embedding_file:
         idx = 0
-        with open(FLAGS.embedding_file, "r") as f:
+        with open(FLAGS.embedding_file, "r", encoding="utf-8") as f:
             for line in f:
                 tokens = line.strip().split(" ")
                 if len(tokens) > FLAGS.dim_word:
@@ -370,13 +370,12 @@ def create_model(embedding):
 
     # final classifier
     with tf.variable_scope("loss", reuse=tf.AUTO_REUSE):
-        # cost = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=label1, logits=logit1)
-        # cost = tf.losses.hinge(y, logit)
-        s1 = tf.range(0, limit=tf.shape(logit)[0], dtype=tf.int32)
-        s2 = tf.ones_like(s1, dtype=tf.int32)
-        indices = tf.stack((s1, s2), axis=1)
-        logit_hinge = tf.gather_nd(logit, indices=indices)
-        cost = tf.losses.hinge_loss(y, logit_hinge)
+        cost = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y, logits=logit)
+        # s1 = tf.range(0, limit=tf.shape(logit)[0], dtype=tf.int32)
+        # s2 = tf.ones_like(s1, dtype=tf.int32)
+        # indices = tf.stack((s1, s2), axis=1)
+        # logit_hinge = tf.gather_nd(logit, indices=indices)
+        # cost = tf.losses.hinge_loss(y, logit_hinge)
         probability = tf.nn.softmax(logit)
 
     return probability, cost
@@ -610,6 +609,9 @@ def predict_metrics(sess, cost_op, probability_op, iterator):
     sum_r2 = 0
     sum_r5 = 0
     total_num = 0
+    p = 0
+    t = 0
+    tp = 0
 
     for i, (s, l) in enumerate(zip(scores, labels)):
         if i % 10 == 0:
@@ -629,6 +631,66 @@ def predict_metrics(sess, cost_op, probability_op, iterator):
 
     metrics = [1. * sum_map / total_num, 1. * sum_mrr / total_num, 1. * sum_p1 / total_num,
                1. * sum_r1 / total_num, 1. * sum_r2 / total_num, 1. * sum_r5 / total_num]
+
+    return metrics, scores
+
+
+def f1_metrics(sess, cost_op, probability_op, iterator):
+    """ Caculate MAP, MRR, Precision@1, Recall@1, Recall@2, Recall@5
+    Args:
+        sess: tf.Session
+        cost_op: cost operation
+        probability_op: probability operation
+        iterator: iterator of dataset
+
+    Return:
+        metrics: float32 list, [MAP, MRR, Precision@1, Recall@1, Recall@2, Recall@5]
+        scores: float32 list, probability for positive label for all instances
+    """
+    n_done = 0
+    scores = []
+    labels = []
+    while True:
+        try:
+            instance = iterator.next()
+        except StopIteration:
+            break
+        if len(instance) <= 0:
+            continue
+        n_done += len(instance)
+        (batch_x1, batch_x1_mask, batch_x2, batch_x2_mask, batch_y) = prepare_data(instance)
+        cost, probability = sess.run([cost_op, probability_op],
+                                     feed_dict={"x1:0": batch_x1, "x1_mask:0": batch_x1_mask,
+                                                "x2:0": batch_x2, "x2_mask:0": batch_x2_mask,
+                                                "y:0": batch_y, "keep_rate:0": 1.0})
+        labels.extend(batch_y)
+        # probability for positive label
+        scores.extend(probability[:, 1].tolist())
+
+    assert len(labels) == n_done
+    assert len(scores) == n_done
+    tf.logging.info("seen samples %s", n_done)
+
+    metrics = dict()
+    for threshold in np.arange(0.1, 1.0, 0.1):
+        p, t, fp, fn, tp = 0, 0, 0, 0, 0
+        for i, (s, l) in enumerate(zip(scores, labels)):
+            if l <= 0:
+                if s > threshold:
+                    fp += 1
+                else:
+                    fn += 1
+            else:
+                t += 1
+                if s > threshold:
+                    tp += 1
+            if s > threshold:
+                p += 1
+
+        denominator = tp + 0.5 * (fp + fn)
+        metrics[threshold] = [tp / p if p > 0 else 0.0,
+                              tp / t if t > 0 else 0.0,
+                              tp / denominator if denominator > 0 else 0.0]
 
     return metrics, scores
 
@@ -661,7 +723,7 @@ def main(_):
     tf.logging.info("***** Loading Vocabulary *****")
     # token_to_idx = load_vocab(FLAGS.vocab_file)
     tokenizer = BertTokenizer.from_pretrained(FLAGS.model_name_or_path, cache_dir=FLAGS.cache_dir,
-                                                 tokenize_chinese_chars=False)
+                                              tokenize_chinese_chars=False)
 
     tf.gfile.MakeDirs(FLAGS.output_dir)
 
@@ -671,10 +733,10 @@ def main(_):
                          batch_size=FLAGS.train_batch_size,
                          vocab_size=FLAGS.vocab_size,
                          shuffle=True)
-    # valid = TextIterator(FLAGS.valid_file, token_to_idx,
-    #                      batch_size=FLAGS.valid_batch_size,
-    #                      vocab_size=FLAGS.vocab_size,
-    #                      shuffle=False)
+    valid = TextIterator(FLAGS.valid_file, tokenizer,
+                         batch_size=FLAGS.valid_batch_size,
+                         vocab_size=FLAGS.vocab_size,
+                         shuffle=False)
     # test = TextIterator(FLAGS.test_file, token_to_idx,
     #                     batch_size=FLAGS.test_batch_size,
     #                     vocab_size=FLAGS.vocab_size,
@@ -758,17 +820,22 @@ def main(_):
             tf.logging.info("seen samples %s each epoch", n_samples)
             tf.logging.info("current learning rate: %s", current_lr)
 
-            # # validate model on validation set and early stop if necessary
+            # validate model on validation set and early stop if necessary
             # valid_metrics, valid_scores = predict_metrics(
-            #     sess, cost_op, probability_op, valid)
-            #
+            #     sess, loss_op, probability_op, valid)
+            valid_metrics, valid_scores = f1_metrics(
+                sess, loss_op, probability_op, valid)
+
             # # select best model based on recall@1 of validation set
             # valid_err = 1.0 - valid_metrics[3]
             # history_errs.append(valid_err)
 
             # tf.logging.info(
             #     "valid set: MAP %s MRR %s Precision@1 %s Recall@1 %s Recall@2 %s Recall@5 %s", *valid_metrics)
-            #
+            for threshold, (precision, recall, f1) in valid_metrics.items():
+                tf.logging.info(
+                    f"threshold: {threshold} Precision: {precision} Recall: {recall} f1: {f1}")
+
             # test_metrics, test_scores = predict_metrics(
             #     sess, cost_op, probability_op, test)
             #
@@ -829,7 +896,7 @@ def main(_):
 if __name__ == "__main__":
     flags.mark_flag_as_required("train_file")
     flags.mark_flag_as_required("model_name_or_path")
-    # flags.mark_flag_as_required("valid_file")
+    flags.mark_flag_as_required("valid_file")
     # flags.mark_flag_as_required("test_file")
     flags.mark_flag_as_required("embedding_file")
     flags.mark_flag_as_required("output_dir")
